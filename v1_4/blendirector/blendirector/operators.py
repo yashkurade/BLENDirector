@@ -1,0 +1,1276 @@
+print("OPERATORS FILE LOADED")
+
+import bpy
+import os
+import json
+import sys
+import subprocess
+import re
+from bpy.app.handlers import persistent
+from mathutils import Matrix
+
+from bpy_extras.io_utils import ImportHelper
+
+from bpy.app.handlers import persistent
+
+from . import asset_cache
+
+SLOT_PATTERN = re.compile(r"^product_slot(?:_(\d+))?$")
+
+
+def slot_number_from_role(role):
+    """'product_slot_3' -> 3. The old plain 'product_slot' counts as 1."""
+
+    if not isinstance(role, str):
+        return None
+
+    match = SLOT_PATTERN.match(role.strip())
+
+    if match is None:
+        return None
+
+    return int(match.group(1)) if match.group(1) else 1
+
+
+def read_slot_numbers(blend_path):
+    """Peek into a preset .blend and return its sorted slot numbers.
+    Never raises: on any problem it returns an empty list."""
+
+    numbers = set()
+    library = None
+
+    try:
+
+        with bpy.data.libraries.load(blend_path, link=True) as (data_from, data_to):
+
+            data_to.objects = list(data_from.objects)
+
+        for obj in data_to.objects:
+
+            if obj is None:
+                continue
+
+            library = obj.library
+
+            number = slot_number_from_role(obj.get("blendirector_role"))
+
+            if number is not None:
+                numbers.add(number)
+
+    except Exception as e:
+
+        print(f"Couldn't scan slots in {blend_path}: {e}")
+
+    # Drop the temporary link so nothing is left in the file
+    if library is not None:
+
+        try:
+            bpy.data.libraries.remove(library)
+        except Exception as e:
+            print(e)
+
+    return sorted(numbers)
+
+
+def find_product_slots(collections):
+    """{slot_number: empty_object} for the imported collections."""
+
+    slots = {}
+
+    for collection in collections:
+
+        for obj in collection.all_objects:
+
+            number = slot_number_from_role(obj.get("blendirector_role"))
+
+            if number is not None and number not in slots:
+                slots[number] = obj
+
+    return slots
+
+class BLENDIRECTOR_OT_set_timeline_product(bpy.types.Operator):
+
+    bl_idname = "blendirector.set_timeline_product"
+    bl_label = "Use Active Object"
+    bl_description = "Use the object currently selected in the Outliner for this slot"
+
+    index: bpy.props.IntProperty()
+    slot_number: bpy.props.IntProperty()
+
+    def execute(self, context):
+
+        timeline = context.scene.blendirector_timeline
+
+        if self.index >= len(timeline):
+            return {'CANCELLED'}
+
+        obj = context.active_object
+
+        if obj is None:
+            self.report({'ERROR'}, "Select an object in the Outliner first.")
+            return {'CANCELLED'}
+
+        if obj.name.startswith("BD_Product_"):
+            self.report({'ERROR'}, "That's a generated copy. Pick your original object.")
+            return {'CANCELLED'}
+
+        for entry in timeline[self.index].products:
+
+            if entry.slot_number == self.slot_number:
+                entry.product = obj
+                return {'FINISHED'}
+
+        return {'CANCELLED'}
+
+# ----------------------------------------------------------
+# Timeline
+# ----------------------------------------------------------
+
+def product_poll(self, obj):
+    # don't offer generated copies as a choice
+    return not obj.name.startswith("BD_Product_")
+
+
+class BLENDIRECTOR_PG_product_slot(bpy.types.PropertyGroup):
+
+    slot_number: bpy.props.IntProperty()
+
+    product: bpy.props.PointerProperty(
+        name="Product",
+        description="Object placed in this slot (leave empty to skip)",
+        type=bpy.types.Object,
+        poll=product_poll
+    )
+
+
+class BLENDIRECTOR_PG_timeline_item(bpy.types.PropertyGroup):
+
+    preset_name: bpy.props.StringProperty()
+
+    blend_path: bpy.props.StringProperty()
+
+    category: bpy.props.StringProperty()
+
+    duration: bpy.props.IntProperty(
+        default=90,
+        min=1
+    )
+
+    products: bpy.props.CollectionProperty(
+        type=BLENDIRECTOR_PG_product_slot
+    )
+
+# ----------------------------------------------------------
+# Asset Folder
+# ----------------------------------------------------------
+
+def get_assets_dir():
+    addon_dir = os.path.dirname(__file__)
+    return os.path.join(addon_dir, "assets")
+
+
+# ----------------------------------------------------------
+# Load a single preset .blend into a node of asset_cache.
+# Shared by scan_assets() and the "Import External Preset"
+# operator, so both build entries the exact same way.
+# ----------------------------------------------------------
+
+def build_preset_entry(node, blend_path):
+    """Read one preset .blend on disk and store it under node[preset_name].
+    Returns the preset_name on success, None on failure."""
+
+    folder = os.path.dirname(blend_path)
+    file = os.path.basename(blend_path)
+
+    preset_name = os.path.splitext(file)[0]
+
+    metadata_path = os.path.join(folder, "preset.json")
+
+    metadata = {}
+
+    if os.path.exists(metadata_path):
+
+        try:
+
+            with open(metadata_path, "r", encoding="utf-8") as f:
+
+                metadata = json.load(f)
+
+        except Exception as e:
+
+            print(e)
+
+    preview_path = None
+
+    for f in os.listdir(folder):
+
+        if f.lower().endswith(".mp4"):
+
+            preview_path = os.path.join(folder, f)
+            break
+
+    slots = read_slot_numbers(blend_path)
+
+    try:
+
+        with bpy.data.libraries.load(blend_path, link=False) as (data_from, data_to):
+
+            node[preset_name] = {
+
+                "blend_path": blend_path,
+
+                "collections": list(data_from.collections),
+
+                "metadata": metadata,
+
+                "preview_path": preview_path,
+
+                "slots": slots
+
+            }
+
+    except Exception as e:
+
+        print(f"Couldn't read {blend_path}")
+        print(e)
+        return None
+
+    return preset_name
+
+
+# ----------------------------------------------------------
+# Scan Assets
+# ----------------------------------------------------------
+
+def scan_assets():
+
+    asset_cache.clear()
+
+    assets_dir = get_assets_dir()
+
+    if not os.path.exists(assets_dir):
+        print("Assets folder not found.")
+        return None
+
+    # Single pass over every .blend anywhere under assets/,
+    # at any folder depth.
+
+    for root, dirs, files in os.walk(assets_dir):
+
+        for file in sorted(files):
+
+            if not file.lower().endswith(".blend"):
+                continue
+
+            blend_path = os.path.join(root, file)
+
+            # Folder hierarchy relative to assets/
+            relative_path = os.path.relpath(root, assets_dir)
+
+            folders = [] if relative_path == "." else relative_path.split(os.sep)
+
+            node = asset_cache
+
+            # Create nested dictionary automatically
+            for folder in folders:
+
+                node = node.setdefault(folder, {})
+
+            build_preset_entry(node, blend_path)
+
+    def print_node(node, indent=0):
+
+        # A "preset" leaf has a blend_path; anything else
+        # is just another folder level to recurse into.
+
+        for name, value in sorted(node.items()):
+
+            if not isinstance(value, dict):
+                continue
+
+            if "blend_path" in value:
+
+                print("   " * indent, "-", name)
+
+                for col in value.get("collections", []):
+                    print("   " * (indent + 1), "*", col)
+
+            else:
+
+                print("   " * indent, f"[{name}]")
+                print_node(value, indent + 1)
+
+    print("\n========== ASSET CACHE ==========")
+    print_node(asset_cache)
+    print("================================\n")
+
+    return None
+
+
+# ----------------------------------------------------------
+# Refresh
+# ----------------------------------------------------------
+
+class BLENDIRECTOR_OT_refresh(bpy.types.Operator):
+
+    bl_idname = "blendirector.refresh"
+    bl_label = "Refresh"
+
+    def execute(self, context):
+
+        scan_assets()
+
+        from . import ui
+        ui.rebuild_browser_items(context.scene)
+
+        self.report({'INFO'}, "Assets refreshed")
+
+        return {'FINISHED'}
+
+
+# ----------------------------------------------------------
+# Import an external preset (a .blend the user made themselves,
+# living outside the addon's bundled assets/ folder)
+# ----------------------------------------------------------
+
+class BLENDIRECTOR_OT_import_external_preset(bpy.types.Operator, ImportHelper):
+
+    bl_idname = "blendirector.import_external_preset"
+    bl_label = "Import External Preset"
+    bl_description = (
+        "Add a preset .blend file from anywhere on disk — must contain "
+        "the same properly tagged empties/collections as a bundled preset"
+    )
+
+    filename_ext = ".blend"
+
+    filter_glob: bpy.props.StringProperty(
+        default="*.blend",
+        options={'HIDDEN'}
+    )
+
+    def execute(self, context):
+
+        blend_path = self.filepath
+
+        if not os.path.isfile(blend_path):
+
+            self.report({'ERROR'}, "File not found")
+            return {'CANCELLED'}
+
+        # External presets get their own top-level folder in the
+        # browser, so they never collide with names from assets/
+        node = asset_cache.setdefault("External", {})
+
+        preset_name = build_preset_entry(node, blend_path)
+
+        if preset_name is None:
+
+            self.report({'ERROR'}, "Couldn't read that .blend as a preset")
+            return {'CANCELLED'}
+
+        scene = context.scene
+
+        if scene is not None:
+
+            from . import ui
+            scene.blendirector_browser_path = "External"
+            scene.blendirector_selected_preset = ""
+            ui.rebuild_browser_items(scene)
+
+        self.report({'INFO'}, f"Imported preset: {preset_name}")
+
+        return {'FINISHED'}
+
+
+class BLENDIRECTOR_OT_preview_video(bpy.types.Operator):
+
+    bl_idname = "blendirector.preview_video"
+    bl_label = "Preview"
+    bl_description = "Play the preview video for this preset"
+
+    video_path: bpy.props.StringProperty()
+
+    def execute(self, context):
+
+        if not self.video_path or not os.path.exists(self.video_path):
+
+            self.report({'ERROR'}, "Preview video not found.")
+            return {'CANCELLED'}
+
+        try:
+
+            if sys.platform.startswith("win"):
+                os.startfile(self.video_path)
+
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", self.video_path])
+
+            else:
+                subprocess.Popen(["xdg-open", self.video_path])
+
+        except Exception as e:
+
+            self.report({'ERROR'}, f"Could not open video: {e}")
+            return {'CANCELLED'}
+
+        return {'FINISHED'}
+
+# ----------------------------------------------------------
+# Append Collection
+# ----------------------------------------------------------
+
+class BLENDIRECTOR_OT_append(bpy.types.Operator):
+
+    bl_idname = "blendirector.append_collection"
+    bl_label = "Append Collection"
+
+    blend_path: bpy.props.StringProperty()
+
+    collection_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+
+        selected_obj = context.active_object
+
+        if selected_obj is None:
+
+            self.report({'ERROR'}, "Please select an object first.")
+            return {'CANCELLED'}
+
+        blend_path = self.blend_path
+
+        with bpy.data.libraries.load(blend_path, link=False) as (data_from, data_to):
+
+            data_to.collections = [self.collection_name]
+
+        imported = bpy.data.collections.get(self.collection_name)
+
+        if imported is None:
+
+            self.report({'ERROR'}, "Import failed")
+            return {'CANCELLED'}
+
+        already_linked = any(
+            child.name == imported.name
+            for child in context.scene.collection.children
+        )
+
+        if not already_linked:
+
+            context.scene.collection.children.link(imported)
+
+        slot = None
+
+        for obj in imported.all_objects:
+
+            if obj.get("blendirector_role") == "product_slot":
+
+                slot = obj
+                break
+
+        if slot is None:
+
+            self.report({'ERROR'}, "No product slot found.")
+            return {'CANCELLED'}
+
+        selected_obj.location = slot.matrix_world.translation
+        selected_obj.rotation_euler = slot.matrix_world.to_euler()
+
+        selected_obj.parent = slot
+        selected_obj.matrix_parent_inverse = slot.matrix_world.inverted()
+
+        self.report({'INFO'}, f"Imported {self.collection_name}")
+
+        return {'FINISHED'}
+
+# ----------------------------------------------------------
+# Add Preset To Timeline
+# ----------------------------------------------------------
+
+class BLENDIRECTOR_OT_add_to_timeline(bpy.types.Operator):
+
+    bl_idname = "blendirector.add_to_timeline"
+    bl_label = "Add To Timeline"
+
+    blend_path: bpy.props.StringProperty()
+    preset_name: bpy.props.StringProperty()
+    category: bpy.props.StringProperty()
+
+    def execute(self, context):
+
+        item = context.scene.blendirector_timeline.add()
+
+        item.preset_name = self.preset_name
+        item.blend_path = self.blend_path
+        item.category = self.category
+
+        # Read duration from preset metadata
+        duration = 90
+
+        for node in asset_cache.values():
+
+            if not isinstance(node, dict):
+                continue
+
+        # Search asset cache for matching preset
+        def find_preset(node):
+
+            if not isinstance(node, dict):
+                return None
+
+            for name, value in node.items():
+
+                if isinstance(value, dict) and "blend_path" in value:
+
+                    if value["blend_path"] == self.blend_path:
+                        return value
+
+                elif isinstance(value, dict):
+
+                    result = find_preset(value)
+
+                    if result:
+                        return result
+
+            return None
+
+        preset = find_preset(asset_cache)
+
+        if preset:
+            metadata = preset.get("metadata", {})
+            item.duration = int(metadata.get("duration", 90))
+
+            for number in preset.get("slots", []):
+
+                entry = item.products.add()
+                entry.slot_number = number
+
+        self.report(
+            {'INFO'},
+            f"Added '{self.preset_name}' to timeline"
+        )
+
+        return {'FINISHED'}
+
+# ----------------------------------------------------------
+# Remove Timeline Item
+# ----------------------------------------------------------
+
+class BLENDIRECTOR_OT_remove_from_timeline(bpy.types.Operator):
+
+    bl_idname = "blendirector.remove_from_timeline"
+    bl_label = "Remove"
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+
+        timeline = context.scene.blendirector_timeline
+
+        if self.index < len(timeline):
+
+            timeline.remove(self.index)
+
+        return {'FINISHED'}
+
+# ----------------------------------------------------------
+# Move Timeline Item Up
+# ----------------------------------------------------------
+
+class BLENDIRECTOR_OT_move_timeline_up(bpy.types.Operator):
+
+    bl_idname = "blendirector.move_timeline_up"
+    bl_label = "Move Up"
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+
+        timeline = context.scene.blendirector_timeline
+
+        if self.index > 0:
+
+            timeline.move(
+                self.index,
+                self.index - 1
+            )
+
+        return {'FINISHED'}       
+
+# ----------------------------------------------------------
+# Move Timeline Item Down
+# ----------------------------------------------------------
+
+class BLENDIRECTOR_OT_move_timeline_down(bpy.types.Operator):
+
+    bl_idname = "blendirector.move_timeline_down"
+    bl_label = "Move Down"
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+
+        timeline = context.scene.blendirector_timeline
+
+        if self.index < len(timeline) - 1:
+
+            timeline.move(
+                self.index,
+                self.index + 1
+            )
+
+        return {'FINISHED'}
+
+def find_product_slot(collections):
+
+    for collection in collections:
+
+        for obj in collection.all_objects:
+
+            if obj.get("blendirector_role") == "product_slot":
+
+                return obj
+
+    return None
+
+def find_camera_recursive(obj):
+
+    if obj.type == 'CAMERA':
+        return obj
+
+    for child in obj.children:
+
+        camera = find_camera_recursive(child)
+
+        if camera:
+            return camera
+
+    return None
+
+
+def find_scene_camera(collections):
+
+    scene_cameras = []
+
+    for collection in collections:
+
+        for obj in collection.all_objects:
+
+            if obj.get("blendirector_role") == "scene_camera":
+
+                scene_cameras.append(obj)
+
+    # No camera rig
+    if len(scene_cameras) == 0:
+        return None, "No scene camera found."
+
+    # More than one camera rig
+    if len(scene_cameras) > 1:
+        return None, "Multiple scene cameras found."
+
+    # Exactly one
+    camera = find_camera_recursive(scene_cameras[0])
+
+    if camera is None:
+        return None, "Scene camera rig has no camera."
+
+    return camera, None
+
+def set_product_visibility(obj, start_frame, end_frame):
+
+    # Before shot
+    obj.hide_viewport = True
+    obj.hide_render = True
+
+    obj.keyframe_insert(
+        data_path="hide_viewport",
+        frame=start_frame - 1
+    )
+
+    obj.keyframe_insert(
+        data_path="hide_render",
+        frame=start_frame - 1
+    )
+
+    # Shot starts
+    obj.hide_viewport = False
+    obj.hide_render = False
+
+    obj.keyframe_insert(
+        data_path="hide_viewport",
+        frame=start_frame
+    )
+
+    obj.keyframe_insert(
+        data_path="hide_render",
+        frame=start_frame
+    )
+
+    # Shot ends
+    obj.hide_viewport = False
+    obj.hide_render = False
+
+    obj.keyframe_insert(
+        data_path="hide_viewport",
+        frame=end_frame
+    )
+
+    obj.keyframe_insert(
+        data_path="hide_render",
+        frame=end_frame
+    )
+
+    # After shot
+    obj.hide_viewport = True
+    obj.hide_render = True
+
+    obj.keyframe_insert(
+        data_path="hide_viewport",
+        frame=end_frame + 1
+    )
+
+    obj.keyframe_insert(
+        data_path="hide_render",
+        frame=end_frame + 1
+    )
+
+def set_shot_objects_visibility(collection, start_frame, end_frame):
+
+    objects = list(collection.all_objects)
+
+    for obj in objects:
+
+        # --------------------------------------------------
+        # DO NOT animate cameras or empties
+        # Cameras are controlled by timeline markers.
+        # Empties may be camera/product parents.
+        # --------------------------------------------------
+
+        if obj.type in {'CAMERA'}:
+            continue
+
+        # --------------------------------------------------
+        # Hidden before shot
+        # --------------------------------------------------
+
+        obj.hide_render = True
+        obj.keyframe_insert(
+            data_path="hide_render",
+            frame=start_frame - 1
+        )
+
+        # --------------------------------------------------
+        # Visible during shot
+        # --------------------------------------------------
+
+        obj.hide_render = False
+        obj.keyframe_insert(
+            data_path="hide_render",
+            frame=start_frame
+        )
+
+        obj.keyframe_insert(
+            data_path="hide_render",
+            frame=end_frame
+        )
+
+        # --------------------------------------------------
+        # Hidden after shot
+        # --------------------------------------------------
+
+        obj.hide_render = True
+        obj.keyframe_insert(
+            data_path="hide_render",
+            frame=end_frame + 1
+        )
+
+@persistent
+def update_shot_viewport_visibility(scene, *args):
+
+    if bpy.app.is_job_running('RENDER'):
+        return
+        
+    # Find Blendirector commercial root
+    root = bpy.data.collections.get("BLENDIRECTOR_COMMERCIAL")
+
+    if root is None:
+        return
+
+    current_frame = scene.frame_current
+
+    # Check every shot collection
+    for shot_collection in root.children:
+
+        # Only process our SHOT collections
+        if not shot_collection.name.startswith("SHOT_"):
+            continue
+
+        start_frame = shot_collection.get("blendirector_start")
+        end_frame = shot_collection.get("blendirector_end")
+
+        if start_frame is None or end_frame is None:
+            continue
+
+        # Is this the currently active shot?
+        visible = (
+            start_frame <= current_frame <= end_frame
+        )
+
+        # Show/hide every object belonging to this shot
+        for obj in shot_collection.all_objects:
+            obj.hide_set(not visible)
+
+def offset_object_animation(obj, offset):
+
+    animation = obj.animation_data
+
+    if animation is None:
+        return
+
+    # ------------------------------------------------------
+    # Active Action
+    # ------------------------------------------------------
+
+    if animation.action:
+
+        action = animation.action.copy()
+
+        for fcurve in action.fcurves:
+
+            for keyframe in fcurve.keyframe_points:
+
+                keyframe.co.x += offset
+                keyframe.handle_left.x += offset
+                keyframe.handle_right.x += offset
+
+        animation.action = action
+
+    # ------------------------------------------------------
+    # NLA
+    # ------------------------------------------------------
+
+    for track in animation.nla_tracks:
+
+        for strip in track.strips:
+
+            strip.frame_start += offset
+            strip.frame_end += offset
+
+def duplicate_hierarchy(source, shot_collection, name_prefix):
+    """Copy an object and every descendant, keep the same parent
+    structure between the copies, and link them all into the shot.
+    Returns the copy of the top-level object."""
+
+    def clone(obj, new_parent):
+
+        new = obj.copy()
+
+        if obj.data:
+
+            try:
+                new.data = obj.data.copy()
+            except:
+                pass
+
+        new.name = f"{name_prefix}_{obj.name}"
+
+        shot_collection.objects.link(new)
+
+        # obj.copy() still points at the ORIGINAL parent,
+        # so re-parent to the copied parent instead
+        new.parent = new_parent
+
+        if new_parent is not None:
+            new.matrix_parent_inverse = obj.matrix_parent_inverse.copy()
+
+        for child in obj.children:
+            clone(child, new)
+
+        return new
+
+    return clone(source, None)
+
+def place_product(product_copy, slot):
+
+    ad = product_copy.animation_data
+
+    animated = ad is not None and ad.action is not None
+
+    if animated:
+
+        # Keyframes are treated as relative to the slot
+        product_copy.parent = slot
+        product_copy.matrix_parent_inverse = Matrix.Identity(4)
+        product_copy.location = (0, 0, 0)
+        product_copy.rotation_euler = (0, 0, 0)
+
+    else:
+
+        product_copy.location = slot.matrix_world.translation
+        product_copy.rotation_euler = slot.matrix_world.to_euler()
+
+        product_copy.parent = slot
+        product_copy.matrix_parent_inverse = slot.matrix_world.inverted()
+
+class BLENDIRECTOR_OT_generate_commercial(bpy.types.Operator):
+
+    bl_idname = "blendirector.generate_commercial"
+    bl_label = "Generate Commercial"
+
+    def execute(self, context):
+
+        timeline = context.scene.blendirector_timeline
+
+        # --------------------------------------------------
+        # Validation
+        # --------------------------------------------------
+
+        if len(timeline) == 0:
+
+            self.report(
+                {'ERROR'},
+                "Timeline is empty."
+            )
+
+            return {'CANCELLED'}
+
+        scene = context.scene
+
+        # --------------------------------------------------
+        # Remove previous generated commercial
+        # --------------------------------------------------
+
+        old_root = bpy.data.collections.get(
+            "BLENDIRECTOR_COMMERCIAL"
+        )
+
+        if old_root:
+
+            for child in list(old_root.children):
+                bpy.data.collections.remove(
+                    child,
+                    do_unlink=True
+                )
+
+            for obj in list(old_root.objects):
+                bpy.data.objects.remove(
+                    obj,
+                    do_unlink=True
+                )
+
+            bpy.data.collections.remove(
+                old_root
+            )
+
+        # --------------------------------------------------
+        # Create generated root collection
+        # --------------------------------------------------
+
+        root = bpy.data.collections.new(
+            "BLENDIRECTOR_COMMERCIAL"
+        )
+
+        scene.collection.children.link(root)
+
+        # --------------------------------------------------
+        # Remove old Blendirector camera markers
+        # --------------------------------------------------
+
+        for marker in list(scene.timeline_markers):
+
+            if marker.name.startswith("BD_SCENE_"):
+
+                scene.timeline_markers.remove(marker)
+
+        # --------------------------------------------------
+        # Timeline generation
+        # --------------------------------------------------
+
+        current_frame = 1
+
+        total_frames = 0
+
+        for index, item in enumerate(timeline):
+
+            self.report(
+                {'INFO'},
+                f"Generating Scene {index + 1}: {item.preset_name}"
+            )
+
+            # ==========================================================
+            # LOAD PRESET COLLECTIONS
+            # ==========================================================
+
+            with bpy.data.libraries.load(
+                item.blend_path,
+                link=False
+            ) as (data_from, data_to):
+
+                collection_names = list(data_from.collections)
+
+                data_to.collections = collection_names
+
+
+            # data_to.collections now contains the actual
+            # imported Blender Collection objects
+
+            imported_collections = [
+                collection
+                for collection in data_to.collections
+                if collection is not None
+            ]
+
+            # ==========================================================
+            # CREATE SHOT COLLECTION
+            # ==========================================================
+
+            shot_collection = bpy.data.collections.new(
+                f"SHOT_{index + 1:02d}_{item.preset_name}"
+            )
+
+            root.children.link(shot_collection)
+
+            if not imported_collections:
+
+                self.report(
+                    {'WARNING'},
+                    f"No collections found in {item.preset_name}"
+                )
+
+                current_frame += item.duration
+                total_frames += item.duration
+
+                continue
+
+            # ==========================================================
+            # PUT PRESET CONTENT INSIDE SHOT COLLECTION
+            # ==========================================================
+
+            for collection in imported_collections:
+
+                # Link preset collection to this shot
+                shot_collection.children.link(collection)
+
+                # Remove direct link from commercial root if present
+                if collection.name in root.children:
+                    root.children.unlink(collection)
+
+            # ==============================================
+            # Find product slots
+            # ==============================================
+
+            slots = find_product_slots(
+                imported_collections
+            )
+
+            if not slots:
+
+                self.report(
+                    {'WARNING'},
+                    f"No product slots in {item.preset_name}"
+                )
+
+            # ==============================================
+            # Duplicate + place a product for each FILLED slot.
+            # Vacant slots are skipped, never an error.
+            # ==============================================
+
+            product_copies = []
+
+            for entry in item.products:
+
+                if entry.product is None:
+                    continue
+
+                slot = slots.get(entry.slot_number)
+
+                if slot is None:
+
+                    self.report(
+                        {'WARNING'},
+                        f"{item.preset_name}: slot {entry.slot_number} not found, skipped"
+                    )
+
+                    continue
+
+                product_copy = duplicate_hierarchy(
+                    entry.product,
+                    shot_collection,
+                    f"BD_Product_{index + 1:02d}_S{entry.slot_number}"
+                )
+
+                place_product(product_copy, slot)
+
+                product_copies.append(product_copy)
+
+            # ==============================================
+            # Shift all animations (must run BEFORE we add
+            # hide_render keyframes below)
+            # ==============================================
+
+            processed_objects = set()
+
+            for collection in imported_collections:
+
+                for obj in collection.all_objects:
+
+                    if obj.name in processed_objects:
+                        continue
+
+                    processed_objects.add(
+                        obj.name
+                    )
+
+                    offset_object_animation(
+                        obj,
+                        current_frame - 1
+                    )
+
+            for product_copy in product_copies:
+
+                for obj in [product_copy, *product_copy.children_recursive]:
+
+                    offset_object_animation(
+                        obj,
+                        current_frame - 1
+                    )
+
+            # ==============================================
+            # Product visibility for this shot
+            # ==============================================
+
+            shot_start = current_frame
+            shot_end = current_frame + item.duration - 1
+
+            shot_collection["blendirector_start"] = shot_start
+            shot_collection["blendirector_end"] = shot_end
+
+            set_shot_objects_visibility(
+                shot_collection,
+                shot_start,
+                shot_end
+            )
+
+            # ==============================================
+            # Find scene camera
+            # ==============================================
+
+            camera, camera_error = find_scene_camera(
+                imported_collections
+            )
+
+            if camera is None:
+
+                self.report(
+                    {'ERROR'},
+                    f"{item.preset_name}: {camera_error}"
+                )
+
+                return {'CANCELLED'}
+
+            marker = scene.timeline_markers.new(
+                f"BD_SCENE_{index + 1:02d}_{item.preset_name}",
+                frame=current_frame
+            )
+
+            marker.camera = camera
+
+            if index == 0:
+
+                scene.camera = camera
+
+            # ==============================================
+            # Next scene
+            # ==============================================
+
+            current_frame += item.duration
+
+            total_frames += item.duration
+
+        update_shot_viewport_visibility(context.scene)
+
+        # --------------------------------------------------
+        # Set final timeline
+        # --------------------------------------------------
+
+        scene.frame_start = 1
+
+        scene.frame_end = total_frames
+
+        scene.frame_set(1)
+
+        self.report(
+            {'INFO'},
+            f"Commercial generated: {total_frames} frames"
+        )
+
+        return {'FINISHED'}
+
+# ----------------------------------------------------------
+# Timeline Property
+# ----------------------------------------------------------
+
+def register_timeline():
+
+    bpy.utils.register_class(BLENDIRECTOR_PG_product_slot)
+    bpy.utils.register_class(BLENDIRECTOR_PG_timeline_item)
+
+    bpy.types.Scene.blendirector_timeline = bpy.props.CollectionProperty(
+        type=BLENDIRECTOR_PG_timeline_item
+    )
+
+
+def unregister_timeline():
+
+    del bpy.types.Scene.blendirector_timeline
+
+    bpy.utils.unregister_class(BLENDIRECTOR_PG_timeline_item)
+    bpy.utils.unregister_class(BLENDIRECTOR_PG_product_slot)
+
+# ----------------------------------------------------------
+# Registration
+# ----------------------------------------------------------
+
+classes = (
+
+    BLENDIRECTOR_OT_refresh,
+    BLENDIRECTOR_OT_import_external_preset,
+    BLENDIRECTOR_OT_append,
+    BLENDIRECTOR_OT_preview_video,
+
+    BLENDIRECTOR_OT_add_to_timeline,
+    BLENDIRECTOR_OT_remove_from_timeline,
+    BLENDIRECTOR_OT_move_timeline_up,
+    BLENDIRECTOR_OT_move_timeline_down,
+
+    BLENDIRECTOR_OT_generate_commercial,
+    BLENDIRECTOR_OT_set_timeline_product,
+
+)
+
+
+def register():
+
+    for c in classes:
+        bpy.utils.register_class(c)
+
+    if update_shot_viewport_visibility not in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.append(
+            update_shot_viewport_visibility
+        )
+
+    register_timeline()
+
+
+def unregister():
+
+    unregister_timeline()
+
+    if update_shot_viewport_visibility in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(
+            update_shot_viewport_visibility
+        )
+
+    for c in reversed(classes):
+        bpy.utils.unregister_class(c)
